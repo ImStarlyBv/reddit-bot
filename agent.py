@@ -1,16 +1,14 @@
 """
-agent.py — the orchestrator.
+agent.py — the single-task orchestrator (the inner loop).
 
-DeepSeek (brain) ⇄ chrome-devtools-mcp (hands) ⇄ your Chrome ⇄ Reddit.
+DeepSeek (brain) ⇄ chrome-devtools-mcp (hands) ⇄ your Chrome ⇄ Quora/Reddit.
 
-Flow:
-  1. Launch chrome-devtools-mcp (stdio) with the persistent profile.
-  2. List its tools -> convert to OpenAI function schemas.
-  3. Load instructions.md as the system prompt.
-  4. Agentic loop: DeepSeek picks a tool -> we call it via MCP -> feed result back -> repeat.
+One call to run_task() = ONE bounded agentic task: DeepSeek picks a tool -> we call it via MCP ->
+feed the result back -> repeat, until it answers or hits MAX_STEPS (the per-task circuit breaker).
+The 24/7 behavior lives in runner.py, which calls run_task() over and over with pacing + limits.
 
-Usage:
-  python agent.py "Open reddit.com and summarize the top 5 posts on r/all"
+Manual use:
+  python agent.py "Go to quora.com and list 5 anime questions in the feed"
 """
 import asyncio
 import json
@@ -23,13 +21,23 @@ from openai import OpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Windows consoles default to cp1252 and choke on emoji in our live output. Force UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 load_dotenv()
 
 HERE = Path(__file__).parent
 PROFILE_DIR = Path(os.getenv("CHROME_PROFILE_DIR", "./chrome-profile")).resolve()
 MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 ALLOW_WRITES = os.getenv("ALLOW_WRITES", "false").lower() == "true"
-MAX_STEPS = int(os.getenv("MAX_STEPS", "25"))
+MAX_STEPS = int(os.getenv("MAX_STEPS", "30"))  # per-task circuit breaker, NOT a runtime limit
+BROWSER_URL = os.getenv("BROWSER_URL", "http://127.0.0.1:9222").strip()
+CONNECT_MODE = os.getenv("CONNECT_MODE", "true").lower() == "true"
+SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "instructions.md")
 
 deepseek = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
@@ -37,16 +45,9 @@ deepseek = OpenAI(
 )
 
 
-BROWSER_URL = os.getenv("BROWSER_URL", "http://127.0.0.1:9222").strip()
-CONNECT_MODE = os.getenv("CONNECT_MODE", "true").lower() == "true"
-
-
 def server_params() -> StdioServerParameters:
-    """
-    CONNECT mode (default): attach to YOUR already-running Chrome (started via start_chrome.ps1)
-    and open work in a new tab of your live, logged-in session — the 'use the browser I'm in' behavior.
-    LAUNCH mode: MCP starts its own Chrome with a persistent profile instead.
-    """
+    """CONNECT (default): attach to your already-running Chrome on BROWSER_URL.
+    LAUNCH: MCP starts its own Chrome with a persistent profile."""
     if CONNECT_MODE:
         args = ["-y", "chrome-devtools-mcp@latest", f"--browserUrl={BROWSER_URL}",
                 "--no-usage-statistics"]
@@ -56,34 +57,31 @@ def server_params() -> StdioServerParameters:
     return StdioServerParameters(command="npx", args=args)
 
 
-def load_system_prompt() -> str:
-    base = (HERE / "instructions.md").read_text(encoding="utf-8")
+def load_system_prompt(allow_writes: bool, runtime_note: str = "") -> str:
+    """instructions.md + the runtime engagement state the runner computed."""
+    base = (HERE / SYSTEM_PROMPT_FILE).read_text(encoding="utf-8")
     gate = (
-        "WRITES ARE ENABLED for this run. You may upvote/comment/post per the rules."
-        if ALLOW_WRITES
-        else "WRITES ARE DISABLED for this run. Read-only. For any state-changing action, describe "
-        "what you WOULD do and stop — do not click the final confirm."
+        "ENGAGEMENT IS ENABLED this run — you may post per the rules."
+        if allow_writes
+        else "ENGAGEMENT IS DISABLED this run — read-only. Describe what you WOULD post but do NOT "
+        "fill or submit any answer/comment box; do not click the final Post/Submit."
     )
-    return f"{base}\n\n## Runtime flags\n{gate}\n"
+    extra = f"\n{runtime_note}" if runtime_note else ""
+    return f"{base}\n\n## Runtime flags (live)\n{gate}{extra}\n"
 
 
 def mcp_tools_to_openai(mcp_tools) -> list[dict]:
-    """Convert MCP tool defs into OpenAI `tools=[...]` function schemas."""
     out = []
     for t in mcp_tools:
-        out.append({
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": (t.description or "")[:1024],
-                "parameters": t.inputSchema or {"type": "object", "properties": {}},
-            },
-        })
+        out.append({"type": "function", "function": {
+            "name": t.name,
+            "description": (t.description or "")[:1024],
+            "parameters": t.inputSchema or {"type": "object", "properties": {}},
+        }})
     return out
 
 
 def extract_text(result) -> str:
-    """Flatten an MCP tool result into text for the model."""
     parts = []
     for block in getattr(result, "content", []) or []:
         text = getattr(block, "text", None)
@@ -94,36 +92,41 @@ def extract_text(result) -> str:
     return "\n".join(parts) if parts else "[no text content]"
 
 
-async def run(task: str) -> None:
+async def run_task(task: str, allow_writes: bool = ALLOW_WRITES, runtime_note: str = "",
+                   max_steps: int = MAX_STEPS) -> str:
+    """Run ONE bounded agentic task. Prints a live play-by-play. Returns the final answer text."""
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[setup] profile={PROFILE_DIR}  model={MODEL}  writes={'ON' if ALLOW_WRITES else 'OFF'}")
+    print(f"[setup] model={MODEL}  writes={'ON' if allow_writes else 'OFF'}  "
+          f"prompt<-{SYSTEM_PROMPT_FILE}  max_steps={max_steps}", flush=True)
 
     async with stdio_client(server_params()) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            tool_list = (await session.list_tools()).tools
-            openai_tools = mcp_tools_to_openai(tool_list)
-            print(f"[setup] {len(openai_tools)} browser tools available")
+            openai_tools = mcp_tools_to_openai((await session.list_tools()).tools)
+            print(f"[setup] {len(openai_tools)} browser tools available", flush=True)
+            print(f"\n🧭 TASK: {task}\n{'─' * 60}", flush=True)
 
             messages = [
-                {"role": "system", "content": load_system_prompt()},
+                {"role": "system", "content": load_system_prompt(allow_writes, runtime_note)},
                 {"role": "user", "content": task},
             ]
 
-            for step in range(1, MAX_STEPS + 1):
+            for step in range(1, max_steps + 1):
                 resp = deepseek.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    tools=openai_tools,
-                    tool_choice="auto",
-                    temperature=0.2,
+                    model=MODEL, messages=messages, tools=openai_tools,
+                    tool_choice="auto", temperature=0.2,
                 )
                 msg = resp.choices[0].message
                 messages.append(msg.model_dump(exclude_none=True))
 
+                # live: the model's reasoning/narration this turn
+                if msg.content and msg.content.strip():
+                    print(f"\n🧠 step {step}: {msg.content.strip()}", flush=True)
+
                 if not msg.tool_calls:
-                    print(f"\n=== DONE (step {step}) ===\n{msg.content}")
-                    return
+                    print(f"\n{'═' * 60}\n✅ FINAL ANSWER (step {step})\n{'═' * 60}\n{msg.content}\n",
+                          flush=True)
+                    return msg.content or ""
 
                 for call in msg.tool_calls:
                     name = call.function.name
@@ -131,29 +134,30 @@ async def run(task: str) -> None:
                         args = json.loads(call.function.arguments or "{}")
                     except json.JSONDecodeError:
                         args = {}
-                    print(f"[step {step}] -> {name}({json.dumps(args)[:160]})")
+                    print(f"  🔧 step {step}: {name}({json.dumps(args)[:140]})", flush=True)
 
                     try:
                         result = await session.call_tool(name, args)
                         content = extract_text(result)
-                    except Exception as e:  # surface the error to the model so it can recover
+                        preview = " ".join(content.split())[:200]
+                        print(f"     ↳ {preview}{'…' if len(content) > 200 else ''}", flush=True)
+                    except Exception as e:  # surface to the model so it can recover
                         content = f"TOOL ERROR: {e}"
-                        print(f"           !! {content}")
+                        print(f"     ‼ {content}", flush=True)
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": content[:8000],
-                    })
+                    messages.append({"role": "tool", "tool_call_id": call.id,
+                                     "content": content[:8000]})
 
-            print(f"\n=== STOPPED: hit MAX_STEPS ({MAX_STEPS}) without finishing ===")
+            print(f"\n⛔ STOPPED: hit MAX_STEPS ({max_steps}) — task ended by circuit breaker.",
+                  flush=True)
+            return "[stopped: max steps reached]"
 
 
 def main() -> None:
     if len(sys.argv) < 2:
         print('Usage: python agent.py "your task for the agent"')
         sys.exit(1)
-    asyncio.run(run(" ".join(sys.argv[1:])))
+    asyncio.run(run_task(" ".join(sys.argv[1:])))
 
 
 if __name__ == "__main__":

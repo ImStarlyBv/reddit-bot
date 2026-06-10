@@ -3,5 +3,6 @@
 venv/
 chrome-profile/
 runs/
+engagement_state.json
 __pycache__/
 *.pyc
