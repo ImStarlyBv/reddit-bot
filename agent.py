@@ -1,14 +1,14 @@
 """
 agent.py — the single-task orchestrator (the inner loop).
 
-DeepSeek (brain) ⇄ chrome-devtools-mcp (hands) ⇄ your Chrome ⇄ Quora/Reddit.
+DeepSeek (brain) ⇄ chrome-devtools-mcp (hands) ⇄ your Chrome ⇄ X (Twitter).
 
 One call to run_task() = ONE bounded agentic task: DeepSeek picks a tool -> we call it via MCP ->
 feed the result back -> repeat, until it answers or hits MAX_STEPS (the per-task circuit breaker).
 The 24/7 behavior lives in runner.py, which calls run_task() over and over with pacing + limits.
 
 Manual use:
-  python agent.py "Go to quora.com and list 5 anime questions in the feed"
+  python agent.py "Go to x.com and list 5 posts from the home timeline"
 """
 import asyncio
 import json
@@ -61,10 +61,10 @@ def load_system_prompt(allow_writes: bool, runtime_note: str = "") -> str:
     """instructions.md + the runtime engagement state the runner computed."""
     base = (HERE / SYSTEM_PROMPT_FILE).read_text(encoding="utf-8")
     gate = (
-        "ENGAGEMENT IS ENABLED this run — you may post per the rules."
+        "ENGAGEMENT IS ENABLED this run — you may post/comment per the rules."
         if allow_writes
-        else "ENGAGEMENT IS DISABLED this run — read-only. Describe what you WOULD post but do NOT "
-        "fill or submit any answer/comment box; do not click the final Post/Submit."
+        else "ENGAGEMENT IS DISABLED this run — read-only. Describe what you WOULD write but do NOT "
+        "type into any compose box; do not click Post or Reply."
     )
     extra = f"\n{runtime_note}" if runtime_note else ""
     return f"{base}\n\n## Runtime flags (live)\n{gate}{extra}\n"
